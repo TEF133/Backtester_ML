@@ -286,18 +286,37 @@ if __name__ == "__main__":
     from data.data_loader import DataLoader
     from strategies.trend_following import TrendFollowing
 
-    # 1. Load multi-asset data
-    loader = DataLoader()
-    tickers = ["CL=F", "NG=F", "GC=F"]
-    df = loader.fetch(tickers, start="2010-01-01", end="2024-01-01")
+    # Extended commodity universe
+    tickers = {
+        "CL=F"  : "Crude Oil",
+        "BZ=F"  : "Brent",
+        "NG=F"  : "Natural Gas",
+        "GC=F"  : "Gold",
+        "SI=F"  : "Silver",
+        "HG=F"  : "Copper",
+        "ZW=F"  : "Wheat",
+        "ZC=F"  : "Corn",
+    }
 
-    close   = df["Close"]
-    close.columns = close.columns.droplevel(0) \
-        if isinstance(close.columns, pd.MultiIndex) else close.columns
+    # 1. Load data
+    loader = DataLoader()
+    df = loader.fetch(
+        list(tickers.keys()),
+        start="2010-01-01",
+        end="2024-01-01"
+    )
+
+    close = df["Close"]
+    if isinstance(close.columns, pd.MultiIndex):
+        close.columns = close.columns.droplevel(0)
+
+    # Drop tickers with too much missing data
+    close = close.dropna(thresh=int(len(close)*0.8), axis=1)
+    print(f"Assets after cleaning: {close.columns.tolist()}")
 
     # 2. Build signals for each asset
     signals = pd.DataFrame(index=close.index)
-    for ticker in tickers:
+    for ticker in close.columns:
         strat = TrendFollowing(fast=20, slow=60)
         signals[ticker] = strat.predict(close[ticker])
 
@@ -312,6 +331,6 @@ if __name__ == "__main__":
     # 5. Plot
     portfolio.plot(
         portfolio_results, asset_pnl,
-        title="Multi-Asset Trend Following: CL + NG + Gold",
-        save_path="evaluation/portfolio_report.png"
+        title="Multi-Asset Commodity Portfolio (8 assets)",
+        save_path="evaluation/expanded_portfolio_report.png"
     )
