@@ -9,128 +9,122 @@ class Portfolio:
     Multi-asset portfolio manager for commodity futures.
     
     Combines signals from multiple assets with:
-    - Volatility scaling per asset (each contributes equal risk)
-    - Correlation-adjusted position sizing
+    - Volatility scaling per asset (equal risk contribution)
+    - Optional regime-based asset rotation
     - Portfolio-level risk management
-    
-    Assets: Crude Oil (CL=F), Natural Gas (NG=F), Gold (GC=F)
     """
 
     def __init__(self, target_vol=0.15, max_position=2.0):
-        """
-        target_vol   : target annualised portfolio volatility (15%)
-        max_position : maximum position size per asset
-        """
         self.target_vol   = target_vol
         self.max_position = max_position
 
     def vol_scale(self, signals, returns, vol_window=20):
-        """
-        Scale each asset's signal by its volatility.
-        
-        Each asset contributes EQUAL RISK to the portfolio.
-        e.g. NG is 3x more volatile than Gold →
-             NG position is 3x smaller than Gold position
-        
-        This is called 'risk parity' — used by Bridgewater, AQR etc.
-        """
+        """Scale each asset signal by its volatility — risk parity."""
         scaled = pd.DataFrame(index=signals.index)
-
         for col in signals.columns:
             if col not in returns.columns:
                 continue
-            ret = returns[col]
-            vol = ret.rolling(vol_window).std() * np.sqrt(252)
-            vol = vol.reindex(signals.index).fillna(method="ffill")
-            vol = vol.replace(0, np.nan).fillna(vol.mean())
-
-            # Scale: target_vol / asset_vol
+            ret    = returns[col]
+            vol    = ret.rolling(vol_window).std() * np.sqrt(252)
+            vol    = vol.reindex(signals.index).ffill()
+            vol    = vol.replace(0, np.nan).fillna(vol.mean())
             scalar = (self.target_vol / vol).clip(0.1, self.max_position)
             scaled[col] = signals[col] * scalar
-
         return scaled
 
-    def correlation_matrix(self, returns, window=60):
+    def regime_rotate(self, scaled_signals, regime_labels,
+                      regime_stats, returns):
         """
-        Rolling correlation between assets.
-        Shows how diversified the portfolio actually is.
-        Low correlation = better diversification = higher Sharpe.
-        """
-        return returns.rolling(window).corr()
-
-    def combine(self, signals, returns, method="equal_weight"):
-        """
-        Combine multi-asset signals into portfolio weights.
+        Rotate asset weights based on current market regime.
         
-        method options:
-        - equal_weight   : each asset gets 1/N weight
-        - vol_weighted   : smaller weight for more volatile assets
-        - signal_weighted: weight by signal strength
+        BULL TREND → overweight risk-on (CL, NG, HG)
+        BEAR TREND → overweight safe haven (GC, SI)
+        HIGH VOL   → reduce all positions by 60%
+        SIDEWAYS   → equal weight (no change)
+        """
+        risk_on    = ["CL=F", "BZ=F", "NG=F", "HG=F", "ZC=F", "ZW=F"]
+        safe_haven = ["GC=F", "SI=F"]
+
+        adj = scaled_signals.copy()
+
+        # Smooth regime — only act when stable for 5+ days
+        stable_regime = regime_labels.rolling(
+            5, min_periods=5
+        ).apply(lambda x: x.iloc[-1] if len(set(x)) == 1 else -1)
+
+        for date in adj.index:
+            if date not in stable_regime.index:
+                continue
+
+            r = stable_regime.loc[date]
+
+            # Skip NaN or unstable
+            if pd.isna(r) or r == -1:
+                continue
+
+            r = int(r)
+
+            if r not in regime_stats:
+                continue
+
+            label = regime_stats[r]["label"]
+
+            for col in adj.columns:
+                if label == "BULL TREND":
+                    if col in risk_on:
+                        adj.loc[date, col] *= 1.4
+                    elif col in safe_haven:
+                        adj.loc[date, col] *= 0.6
+
+                elif label == "BEAR TREND":
+                    if col in safe_haven:
+                        adj.loc[date, col] *= 1.4
+                    elif col in risk_on:
+                        adj.loc[date, col] *= 0.6
+
+                elif label == "HIGH VOL":
+                    adj.loc[date, col] *= 0.4
+
+                # SIDEWAYS → no change
+
+        return adj
+
+    def run_backtest(self, signals, returns,
+                     regime_labels=None, regime_stats=None):
+        """
+        Run portfolio backtest.
+        Optionally applies regime-based rotation.
         """
         scaled = self.vol_scale(signals, returns)
 
-        if method == "equal_weight":
-            n = scaled.shape[1]
-            portfolio_signal = scaled.sum(axis=1) / n
-
-        elif method == "vol_weighted":
-            # Inverse vol weighting
-            vols = {}
-            for col in returns.columns:
-                if col in scaled.columns:
-                    vols[col] = returns[col].rolling(20).std().reindex(
-                        scaled.index).fillna(method="ffill")
-            vol_df   = pd.DataFrame(vols)
-            inv_vol  = 1 / vol_df
-            weights  = inv_vol.div(inv_vol.sum(axis=1), axis=0)
-            portfolio_signal = (scaled * weights).sum(axis=1)
-
-        elif method == "signal_weighted":
-            # Weight by absolute signal strength
-            abs_signals = scaled.abs()
-            weights     = abs_signals.div(
-                abs_signals.sum(axis=1), axis=0
-            ).fillna(1 / scaled.shape[1])
-            portfolio_signal = (scaled * weights).sum(axis=1)
-
-        return portfolio_signal.rename("portfolio_signal")
-
-    def run_backtest(self, signals, returns):
-        """
-        Run portfolio backtest across all assets.
-        
-        Returns:
-        - portfolio_results : combined portfolio P&L
-        - asset_results     : individual asset P&L
-        """
-        scaled = self.vol_scale(signals, returns)
+        if regime_labels is not None and regime_stats is not None:
+            scaled = self.regime_rotate(
+                scaled, regime_labels, regime_stats, returns
+            )
 
         # Individual asset P&L
         asset_pnl = {}
         for col in scaled.columns:
             if col not in returns.columns:
                 continue
-            strat_ret = scaled[col] * returns[col]
+            strat_ret      = scaled[col] * returns[col]
             asset_pnl[col] = (1 + strat_ret).cumprod()
-
         asset_pnl_df = pd.DataFrame(asset_pnl)
 
         # Combined portfolio P&L
-        n = scaled.shape[1]
+        n             = scaled.shape[1]
         portfolio_ret = pd.Series(0.0, index=scaled.index)
         for col in scaled.columns:
             if col in returns.columns:
                 portfolio_ret += scaled[col] * returns[col] / n
 
-        portfolio_cumulative = (1 + portfolio_ret).cumprod()
-
-        # Benchmark — equal weight buy & hold
+        portfolio_cum = (1 + portfolio_ret).cumprod()
         benchmark_ret = returns.mean(axis=1)
         benchmark_cum = (1 + benchmark_ret).cumprod()
 
         portfolio_results = pd.DataFrame({
             "strategy_return" : portfolio_ret,
-            "cumulative_pnl"  : portfolio_cumulative,
+            "cumulative_pnl"  : portfolio_cum,
             "benchmark"       : benchmark_cum,
             "signal"          : scaled.mean(axis=1)
         })
@@ -149,13 +143,6 @@ class Portfolio:
 
     def plot(self, portfolio_results, asset_pnl_df,
              title="Multi-Asset Portfolio", save_path=None):
-        """
-        Full portfolio dashboard:
-        - Portfolio vs benchmark
-        - Individual asset P&L
-        - Drawdown
-        - Asset correlation heatmap
-        """
         fig = plt.figure(figsize=(16, 14))
         fig.suptitle(title, fontsize=14, fontweight="bold")
         gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45)
@@ -168,8 +155,7 @@ class Portfolio:
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_results.index,
                  portfolio_results["cumulative_pnl"],
-                 label="Portfolio", color="steelblue",
-                 linewidth=2)
+                 label="Portfolio", color="steelblue", linewidth=2)
         ax1.plot(portfolio_results.index,
                  portfolio_results["benchmark"],
                  label="Equal Weight B&H", color="orange",
@@ -189,16 +175,18 @@ class Portfolio:
                            facecolor="lightyellow", alpha=0.8))
 
         # --- Chart 2: Individual Assets ---
-        ax2   = fig.add_subplot(gs[1, 0])
-        colors = ["steelblue", "green", "gold"]
+        ax2    = fig.add_subplot(gs[1, 0])
+        colors = ["steelblue", "darkblue", "green",
+                  "gold", "silver", "orange", "brown", "pink"]
         for i, col in enumerate(asset_pnl_df.columns):
             ax2.plot(asset_pnl_df.index, asset_pnl_df[col],
-                     label=col, color=colors[i % len(colors)],
+                     label=col,
+                     color=colors[i % len(colors)],
                      linewidth=1.2)
         ax2.axhline(1.0, color="grey", linestyle=":", linewidth=0.8)
         ax2.set_title("Individual Asset P&L")
         ax2.set_ylabel("Value")
-        ax2.legend(fontsize=8)
+        ax2.legend(fontsize=7)
         ax2.grid(True, alpha=0.3)
 
         # --- Chart 3: Drawdown ---
@@ -215,7 +203,7 @@ class Portfolio:
         ax3.grid(True, alpha=0.3)
 
         # --- Chart 4: Rolling Sharpe ---
-        ax4 = fig.add_subplot(gs[2, 0])
+        ax4         = fig.add_subplot(gs[2, 0])
         rolling_ret = portfolio_results["strategy_return"]
         roll_sharpe = (
             rolling_ret.rolling(126).mean() * 252 /
@@ -231,7 +219,7 @@ class Portfolio:
         ax4.legend(fontsize=8)
         ax4.grid(True, alpha=0.3)
 
-        # --- Chart 5: Asset correlation ---
+        # --- Chart 5: Correlation heatmap ---
         ax5 = fig.add_subplot(gs[2, 1])
         if asset_pnl_df.shape[1] > 1:
             ret_df = asset_pnl_df.pct_change().dropna()
@@ -241,12 +229,13 @@ class Portfolio:
             plt.colorbar(im, ax=ax5)
             ax5.set_xticks(range(len(corr.columns)))
             ax5.set_yticks(range(len(corr.columns)))
-            ax5.set_xticklabels(corr.columns, fontsize=8)
-            ax5.set_yticklabels(corr.columns, fontsize=8)
+            ax5.set_xticklabels(
+                corr.columns, fontsize=7, rotation=45)
+            ax5.set_yticklabels(corr.columns, fontsize=7)
             for i in range(len(corr)):
                 for j in range(len(corr.columns)):
                     ax5.text(j, i, f"{corr.iloc[i,j]:.2f}",
-                             ha="center", va="center", fontsize=9)
+                             ha="center", va="center", fontsize=7)
         ax5.set_title("Asset Return Correlation")
 
         plt.tight_layout()
@@ -255,20 +244,22 @@ class Portfolio:
             print(f"Saved to {save_path}")
         plt.show()
 
-    def print_summary(self, portfolio_results, asset_pnl_df):
+    def print_summary(self, portfolio_results, asset_pnl_df,
+                      label="Portfolio"):
         r         = portfolio_results["strategy_return"]
         total_ret = portfolio_results["cumulative_pnl"].iloc[-1] - 1
         bench_ret = portfolio_results["benchmark"].iloc[-1] - 1
 
-        print("=" * 50)
-        print("     MULTI-ASSET PORTFOLIO SUMMARY")
-        print("=" * 50)
+        print("=" * 55)
+        print(f"     {label.upper()} SUMMARY")
+        print("=" * 55)
         print(f"Period       : {portfolio_results.index[0].date()} "
               f"→ {portfolio_results.index[-1].date()}")
         print(f"Total return : {total_ret:.2%}")
         print(f"Benchmark    : {bench_ret:.2%}")
         print(f"Sharpe ratio : {self.sharpe(r):.2f}")
-        print(f"Max drawdown : {self.max_drawdown(portfolio_results['cumulative_pnl']):.2%}")
+        print(f"Max drawdown : "
+              f"{self.max_drawdown(portfolio_results['cumulative_pnl']):.2%}")
         print(f"Ann. vol     : {r.std() * np.sqrt(252):.2%}")
         print(f"Win rate     : {(r > 0).mean():.2%}")
         print()
@@ -278,59 +269,116 @@ class Portfolio:
             print(f"  {col:8s} → "
                   f"Return: {asset_pnl_df[col].iloc[-1]-1:.2%} | "
                   f"Sharpe: {self.sharpe(ret):.2f}")
-        print("=" * 50)
+        print("=" * 55)
 
 
-# Quick test
+# =============================================================================
+# MAIN — Compare plain vs regime-aware multi-asset portfolio
+# =============================================================================
+
 if __name__ == "__main__":
     from data.data_loader import DataLoader
     from strategies.trend_following import TrendFollowing
-
-    # Extended commodity universe
-    tickers = {
-        "CL=F"  : "Crude Oil",
-        "BZ=F"  : "Brent",
-        "NG=F"  : "Natural Gas",
-        "GC=F"  : "Gold",
-        "SI=F"  : "Silver",
-        "HG=F"  : "Copper",
-        "ZW=F"  : "Wheat",
-        "ZC=F"  : "Corn",
-    }
+    from features.regime_detector import RegimeDetector
 
     # 1. Load data
-    loader = DataLoader()
-    df = loader.fetch(
-        list(tickers.keys()),
-        start="2010-01-01",
-        end="2024-01-01"
-    )
+    loader  = DataLoader()
+    tickers = ["CL=F", "BZ=F", "NG=F", "GC=F", "SI=F", "HG=F"]
+    df      = loader.fetch(tickers, start="2010-01-01", end="2024-01-01")
 
     close = df["Close"]
     if isinstance(close.columns, pd.MultiIndex):
         close.columns = close.columns.droplevel(0)
+    close = close.dropna(thresh=int(len(close) * 0.8), axis=1)
+    print(f"Assets: {close.columns.tolist()}")
 
-    # Drop tickers with too much missing data
-    close = close.dropna(thresh=int(len(close)*0.8), axis=1)
-    print(f"Assets after cleaning: {close.columns.tolist()}")
-
-    # 2. Build signals for each asset
+    # 2. Build returns and signals
+    returns = np.log(close / close.shift(1)).shift(-1)
     signals = pd.DataFrame(index=close.index)
     for ticker in close.columns:
         strat = TrendFollowing(fast=20, slow=60)
         signals[ticker] = strat.predict(close[ticker])
 
-    # 3. Build returns
-    returns = np.log(close / close.shift(1)).shift(-1)
+    # 3. Fit regime detector on Crude Oil
+    print("\nFitting regime detector on CL=F...")
+    cl_close = close["CL=F"] if "CL=F" in close.columns \
+               else close.iloc[:, 0]
+    detector = RegimeDetector(n_regimes=4)
+    detector.fit(cl_close)
+    regime_labels, regime_probs = detector.predict(cl_close)
+    regime_stats = detector.label_regimes(cl_close, regime_labels)
+    detector.print_summary()
 
-    # 4. Run portfolio
+    # 4. Plain portfolio
+    print("\n--- PLAIN PORTFOLIO ---")
     portfolio = Portfolio(target_vol=0.15)
-    portfolio_results, asset_pnl = portfolio.run_backtest(signals, returns)
-    portfolio.print_summary(portfolio_results, asset_pnl)
+    res_plain, pnl_plain = portfolio.run_backtest(signals, returns)
+    portfolio.print_summary(res_plain, pnl_plain, "Plain Portfolio")
 
-    # 5. Plot
+    # 5. Regime-aware portfolio
+    print("\n--- REGIME-AWARE PORTFOLIO ---")
+    res_regime, pnl_regime = portfolio.run_backtest(
+        signals, returns,
+        regime_labels = regime_labels,
+        regime_stats  = regime_stats
+    )
+    portfolio.print_summary(
+        res_regime, pnl_regime, "Regime-Aware Portfolio"
+    )
+
+    # 6. Comparison chart
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+    fig.suptitle(
+        "Plain vs Regime-Aware Multi-Asset Portfolio",
+        fontsize=14, fontweight="bold"
+    )
+
+    ax = axes[0]
+    ax.plot(res_plain.index, res_plain["cumulative_pnl"],
+            label=f"Plain "
+                  f"(Sharpe: "
+                  f"{portfolio.sharpe(res_plain['strategy_return']):.2f})",
+            color="steelblue", linewidth=1.5)
+    ax.plot(res_regime.index, res_regime["cumulative_pnl"],
+            label=f"Regime-Aware "
+                  f"(Sharpe: "
+                  f"{portfolio.sharpe(res_regime['strategy_return']):.2f})",
+            color="green", linewidth=1.5)
+    ax.plot(res_plain.index, res_plain["benchmark"],
+            label="Buy & Hold", color="orange", linestyle="--")
+    ax.axhline(1.0, color="grey", linestyle=":", linewidth=0.8)
+    ax.set_title("Cumulative P&L")
+    ax.set_ylabel("Portfolio Value")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax2 = axes[1]
+    for res, color, label in [
+        (res_plain,  "steelblue", "Plain"),
+        (res_regime, "green",     "Regime-Aware")
+    ]:
+        cum = res["cumulative_pnl"]
+        dd  = (cum - cum.cummax()) / cum.cummax()
+        ax2.fill_between(res.index, dd, 0,
+                         alpha=0.3, color=color, label=label)
+    ax2.set_title("Drawdown Comparison")
+    ax2.set_ylabel("Drawdown %")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("evaluation/regime_portfolio_comparison.png",
+                dpi=150, bbox_inches="tight")
+    plt.show()
+
+    # 7. Individual full reports
     portfolio.plot(
-        portfolio_results, asset_pnl,
-        title="Multi-Asset Commodity Portfolio (8 assets)",
-        save_path="evaluation/expanded_portfolio_report.png"
+        res_plain, pnl_plain,
+        title     = "Plain Multi-Asset Portfolio",
+        save_path = "evaluation/plain_portfolio.png"
+    )
+    portfolio.plot(
+        res_regime, pnl_regime,
+        title     = "Regime-Aware Multi-Asset Portfolio",
+        save_path = "evaluation/regime_portfolio.png"
     )
